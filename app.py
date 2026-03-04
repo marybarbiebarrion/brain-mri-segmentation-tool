@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 from einops import rearrange
 from timm.models.layers import trunc_normal_
 from timm.models.vision_transformer import Block
@@ -201,6 +202,21 @@ def run_model_inference_3d(image_volume, model_name):
     return pred_volume
 
 def main():
+    # --- INITIALIZE SESSION STATE ---
+    # Prevents KeyErrors by ensuring variables exist before the first 'Run Analysis' click
+    if 'run' not in st.session_state:
+        st.session_state['run'] = False
+    if 'mri_data' not in st.session_state:
+        st.session_state['mri_data'] = None
+    if 'gt_data' not in st.session_state:
+        st.session_state['gt_data'] = None
+    if 'all_preds' not in st.session_state:
+        st.session_state['all_preds'] = {}
+    if 'active_models' not in st.session_state:
+        st.session_state['active_models'] = []
+    if 'execution_time' not in st.session_state:
+        st.session_state['execution_time'] = 0.0
+
     st.set_page_config(page_title="Brain MRI Segmenter", layout="wide", initial_sidebar_state="expanded")
     st.sidebar.title("Navigation Menu")
     page = st.sidebar.radio("Go to:", ["1. Workspace", "2. Model Information"])
@@ -213,8 +229,6 @@ def main():
         col1, col2 = st.columns([1, 2.5])
         with col1:
             st.subheader("Controls")
-            
-            # Feature: Multi-model selection (Max 3)
             compare_mode = st.toggle("Enable Model Comparison")
             
             if compare_mode:
@@ -224,24 +238,23 @@ def main():
                     max_selections=3
                 )
             else:
-                # Standard single model mode
                 selected_model = st.selectbox("Select Architecture", list(MODELS.keys()))
                 selected_models = [selected_model]
             
             st.markdown("<br>", unsafe_allow_html=True) 
-            
             uploaded_mri = st.file_uploader("Upload MRI Scan (e.g., T1/T2)", type=["nii", "nii.gz"])
             uploaded_gt = st.file_uploader("Upload Ground Truth Mask (Optional)", type=["nii", "nii.gz"])
             
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Run Analysis", use_container_width=True):
                 if uploaded_mri is not None and len(selected_models) > 0:
+                    # START TIMER
+                    start_time = time.time()
+                    
                     with st.spinner(f"Processing 3D volume with {len(selected_models)} model(s)..."):
-                        # Load MRI once
                         st.session_state['mri_data'] = load_nifti_file(uploaded_mri)
-                        
-                        # Dictionary to store multiple predictions
                         st.session_state['all_preds'] = {}
+                        
                         for model_name in selected_models:
                             st.session_state['all_preds'][model_name] = run_model_inference_3d(
                                 st.session_state['mri_data'], model_name
@@ -254,6 +267,9 @@ def main():
                         else:
                             st.session_state['gt_data'] = None
                             
+                    # END TIMER
+                    end_time = time.time()
+                    st.session_state['execution_time'] = end_time - start_time
                     st.session_state['run'] = True
                     st.session_state['active_models'] = selected_models
                 elif uploaded_mri is None:
@@ -263,7 +279,16 @@ def main():
                 
         with col2:
             st.subheader("Interactive Comparison Dashboard")
-            if 'run' in st.session_state and st.session_state['run']:
+            if st.session_state['run']:
+                # Execution Time Information
+                total_time = st.session_state['execution_time']
+                num_models = len(st.session_state['active_models'])
+                avg_time = total_time / num_models if num_models > 0 else 0
+                
+                t_col1, t_col2 = st.columns(2)
+                t_col1.metric("Total Processing Time", f"{total_time:.2f} s")
+                t_col2.metric("Average Time per Model", f"{avg_time:.2f} s")
+
                 mri_vol = st.session_state['mri_data']
                 gt_vol = st.session_state['gt_data']
                 active_models = st.session_state['active_models']
@@ -274,8 +299,7 @@ def main():
                 brats_cmap = ListedColormap(['none', 'red', 'limegreen', 'blue'])
                 mri_slice = mri_vol[:, :, slice_idx]
                 
-                # Dynamic column logic
-                # Order: [Original] + [GT (if exists)] + [Model 1] + [Model 2 (optional)] + [Model 3 (optional)]
+                # Dynamic column logic: [Original] + [GT] + [Predictions...]
                 plot_titles = ["Original Image"]
                 if gt_vol is not None:
                     plot_titles.append("Ground Truth")
@@ -284,46 +308,36 @@ def main():
                 
                 num_plots = len(plot_titles)
                 fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5))
+                if num_plots == 1: axes = [axes]
                 
-                # Handle single plot case (axes won't be an array)
-                if num_plots == 1:
-                    axes = [axes]
-                
-                # Plot 1: Original Image
                 axes[0].imshow(mri_slice, cmap='gray')
-                axes[0].set_title(f"{plot_titles[0]} ({slice_idx})", fontsize=12, pad=10)
+                axes[0].set_title(f"Original Image ({slice_idx})", fontsize=12, pad=10)
                 axes[0].axis('off')
                 
                 current_col = 1
-                
-                # Plot 2: Ground Truth (Optional)
                 if gt_vol is not None:
                     gt_slice_masked = np.ma.masked_where(gt_vol[:, :, slice_idx] == 0, gt_vol[:, :, slice_idx])
                     axes[current_col].imshow(mri_slice, cmap='gray')
                     axes[current_col].imshow(gt_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
-                    axes[current_col].set_title(plot_titles[current_col], fontsize=12, pad=10)
+                    axes[current_col].set_title("Ground Truth", fontsize=12, pad=10)
                     axes[current_col].axis('off')
                     current_col += 1
                 
-                # Remaining Plots: Selected Model Predictions
                 for model_name in active_models:
                     pred_vol = st.session_state['all_preds'][model_name]
-                    pred_slice = pred_vol[:, :, slice_idx]
-                    pred_slice_masked = np.ma.masked_where(pred_slice == 0, pred_slice)
-                    
+                    pred_slice_masked = np.ma.masked_where(pred_vol[:, :, slice_idx] == 0, pred_vol[:, :, slice_idx])
                     axes[current_col].imshow(mri_slice, cmap='gray')
                     axes[current_col].imshow(pred_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
-                    axes[current_col].set_title(plot_titles[current_col], fontsize=12, pad=10)
+                    axes[current_col].set_title(f"Pred: {model_name}", fontsize=12, pad=10)
                     axes[current_col].axis('off')
                     current_col += 1
                 
                 plt.tight_layout()
                 st.pyplot(fig)
-                
                 st.markdown("Legend: Red: NCR/NET | Green: Edema | Blue: Enhancing Tumor")
                 
-                # Display Metrics Scoreboard for active models
-                st.markdown("### Model Comparison Scoreboard")
+                # Metrics Scoreboard
+                st.markdown("### Model Performance Comparison")
                 m_cols = st.columns(len(active_models))
                 for idx, m_name in enumerate(active_models):
                     with m_cols[idx]:
@@ -332,21 +346,19 @@ def main():
                         st.write(f"DSC: {metrics.get('DSC', 'N/A')}")
                         st.write(f"HD: {metrics.get('HD', 'N/A')} mm")
             else:
-                st.info("Upload your scan and select up to 3 models to begin comparison.")
+                st.info("Upload your scan and select models to begin comparison.")
 
     elif page == "2. Model Information":
         st.title("Model Selection Scoreboard")
-        st.markdown("Use this guide to determine which architecture is best suited for your specific clinical scenario.")
-        
-        # [Keep existing Scoreboard columns and sorted table here]
+        # [Existing Scoreboard code goes here]
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.info("Best Volumetric Overlap\n\n### UNet++\n**DSC: 0.1661**\n\nScenario: When capturing the bulk mass and overall volume of the tumor is the highest priority.")
+            st.info("Best Volumetric Overlap\n\n### UNet++\n**DSC: 0.1661**\n\nScenario: Volume priority.")
         with col2:
-            st.success("Best Boundary Precision\n\n### SegResNet\n**HD: 8.51 mm**\n\nScenario: For surgical planning where detecting exact tumor edges is critical.")
+            st.success("Best Boundary Precision\n\n### SegResNet\n**HD: 8.51 mm**\n\nScenario: Surgical precision.")
         with col3:
-            st.warning("Best Overall Balance\n\n### SegResNet\n**S_comp: 0.2600**\n\nScenario: Reliable all-rounder balancing volume detection and boundary precision.")
-
+            st.warning("Best Overall Balance\n\n### SegResNet\n**S_comp: 0.2600**\n\nScenario: Reliable all-rounder.")
+        
         st.markdown("---")
         sorted_metrics = dict(sorted(MODEL_METRICS.items(), key=lambda item: float(item[1]['DSC']), reverse=True))
         st.table(sorted_metrics)
