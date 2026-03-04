@@ -55,3 +55,4 @@ zipp==3.23.0
 # segmentation/medical imaging
 segmentation-models-pytorch
 monai
+fpdf

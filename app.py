@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import io
+from fpdf import FPDF
 from einops import rearrange
 from timm.models.layers import trunc_normal_
 from timm.models.vision_transformer import Block
@@ -200,7 +202,55 @@ def run_model_inference_3d(image_volume, model_name):
             
     return pred_volume
 
+def convert_to_nifti(data, affine):
+    """Converts numpy data back to a NIfTI byte stream."""
+    new_img = nib.Nifti1Image(data, affine)
+    img_byte_arr = io.BytesIO()
+    # Using a temporary file because nibabel saves to disk
+    nib.save(new_img, "temp_export.nii.gz")
+    with open("temp_export.nii.gz", "rb") as f:
+        img_byte_arr.write(f.read())
+    return img_byte_arr.getvalue()
+
+def generate_slice_pdf(mri_vol, pred_vol, slices, model_name):
+    """Generates a PDF report containing selected slices."""
+    pdf = FPDF()
+    brats_cmap = ListedColormap(['none', 'red', 'limegreen', 'blue'])
+    
+    for s in slices:
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(40, 10, f"Analysis Report: {model_name} - Slice {s}")
+        
+        # Create plot for PDF
+        fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+        ax.imshow(np.rot90(mri_vol[:, :, s], k=-1), cmap='gray')
+        mask = np.ma.masked_where(pred_vol[:, :, s] == 0, pred_vol[:, :, s])
+        ax.imshow(np.rot90(mask, k=-1), cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
+        ax.axis('off')
+        
+        img_buf = io.BytesIO()
+        plt.savefig(img_buf, format='png', bbox_inches='tight')
+        plt.close(fig)
+        
+        pdf.image(img_buf, x=10, y=30, w=180)
+        
+    return pdf.output(dest='S').encode('latin-1')
+
 def main():
+# --- INITIALIZE SESSION STATE ---
+    # This prevents the KeyError by ensuring the variables exist even before 'Run Analysis' is clicked
+    if 'run' not in st.session_state:
+        st.session_state['run'] = False
+    if 'mri_data' not in st.session_state:
+        st.session_state['mri_data'] = None
+    if 'gt_data' not in st.session_state:
+        st.session_state['gt_data'] = None
+    if 'all_preds' not in st.session_state:
+        st.session_state['all_preds'] = {}
+    if 'active_models' not in st.session_state:
+        st.session_state['active_models'] = []
+
     st.set_page_config(page_title="Brain MRI Segmenter", layout="wide", initial_sidebar_state="expanded")
     st.sidebar.title("Navigation Menu")
     page = st.sidebar.radio("Go to:", ["1. Workspace", "2. Model Information"])
@@ -213,54 +263,41 @@ def main():
         col1, col2 = st.columns([1, 2.5])
         with col1:
             st.subheader("Controls")
-            
-            # Feature: Multi-model selection (Max 3)
             compare_mode = st.toggle("Enable Model Comparison")
             
             if compare_mode:
-                selected_models = st.multiselect(
-                    "Select up to 3 Models to Compare", 
-                    options=list(MODELS.keys()), 
-                    max_selections=3
-                )
+                selected_models = st.multiselect("Select up to 3 Models", options=list(MODELS.keys()), max_selections=3)
             else:
-                # Standard single model mode
                 selected_model = st.selectbox("Select Architecture", list(MODELS.keys()))
                 selected_models = [selected_model]
             
-            st.markdown("<br>", unsafe_allow_html=True) 
+            uploaded_mri = st.file_uploader("Upload MRI Scan (.nii)", type=["nii", "nii.gz"])
+            uploaded_gt = st.file_uploader("Upload Ground Truth (.nii)", type=["nii", "nii.gz"])
             
-            uploaded_mri = st.file_uploader("Upload MRI Scan (e.g., T1/T2)", type=["nii", "nii.gz"])
-            uploaded_gt = st.file_uploader("Upload Ground Truth Mask (Optional)", type=["nii", "nii.gz"])
-            
-            st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Run Analysis", use_container_width=True):
-                if uploaded_mri is not None and len(selected_models) > 0:
-                    with st.spinner(f"Processing 3D volume with {len(selected_models)} model(s)..."):
-                        # Load MRI once
+                if uploaded_mri:
+                    with st.spinner("Processing..."):
                         st.session_state['mri_data'] = load_nifti_file(uploaded_mri)
-                        
-                        # Dictionary to store multiple predictions
-                        st.session_state['all_preds'] = {}
-                        for model_name in selected_models:
-                            st.session_state['all_preds'][model_name] = run_model_inference_3d(
-                                st.session_state['mri_data'], model_name
-                            )
-                        
-                        if uploaded_gt is not None:
-                            gt_data = load_nifti_file(uploaded_gt).astype(np.int64)
-                            gt_data[gt_data == 4] = 3 
-                            st.session_state['gt_data'] = gt_data
-                        else:
-                            st.session_state['gt_data'] = None
-                            
-                    st.session_state['run'] = True
-                    st.session_state['active_models'] = selected_models
-                elif uploaded_mri is None:
-                    st.error("Please upload an MRI file first.")
-                else:
-                    st.error("Please select at least one model.")
+                        st.session_state['all_preds'] = {m: run_model_inference_3d(st.session_state['mri_data'], m) for m in selected_models}
+                        st.session_state['run'] = True
+                        st.session_state['active_models'] = selected_models
+            
+            # --- NEW: Export Section ---
+            if 'run' in st.session_state and st.session_state['run']:
+                st.markdown("---")
+                st.subheader("Export Options")
                 
+                # 1. Full NIfTI Download
+                target_export = st.selectbox("Select Model to Export", st.session_state['active_models'])
+                nii_data = convert_to_nifti(st.session_state['all_preds'][target_export], np.eye(4))
+                st.download_button("Download 3D Segmentation (.nii.gz)", data=nii_data, file_name=f"{target_export}_seg.nii.gz")
+                
+                # 2. Slice Image/PDF Download
+                export_slices = st.multiselect("Select Slices for PDF/Image Report", options=list(range(st.session_state['mri_data'].shape[2])))
+                if export_slices:
+                    pdf_data = generate_slice_pdf(st.session_state['mri_data'], st.session_state['all_preds'][target_export], export_slices, target_export)
+                    st.download_button("Download Selected Slices (PDF)", data=pdf_data, file_name="segmentation_report.pdf")
+
         with col2:
             st.subheader("Interactive Comparison Dashboard")
             if 'run' in st.session_state and st.session_state['run']:
@@ -269,70 +306,44 @@ def main():
                 active_models = st.session_state['active_models']
                 
                 max_slice = mri_vol.shape[2] - 1
-                slice_idx = st.slider("Navigate Brain Slices (Z-axis)", 0, max_slice, max_slice // 2)
+                slice_idx = st.slider("Navigate Brain Slices", 0, max_slice, max_slice // 2)
                 
                 brats_cmap = ListedColormap(['none', 'red', 'limegreen', 'blue'])
                 mri_slice = mri_vol[:, :, slice_idx]
                 
-                # Dynamic column logic
-                # Order: [Original] + [GT (if exists)] + [Model 1] + [Model 2 (optional)] + [Model 3 (optional)]
+                # Generate dynamic plots
                 plot_titles = ["Original Image"]
-                if gt_vol is not None:
-                    plot_titles.append("Ground Truth")
-                for m_name in active_models:
-                    plot_titles.append(f"Pred: {m_name}")
+                if gt_vol is not None: plot_titles.append("Ground Truth")
+                for m_name in active_models: plot_titles.append(f"Pred: {m_name}")
                 
                 num_plots = len(plot_titles)
                 fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5))
+                if num_plots == 1: axes = [axes]
                 
-                # Handle single plot case (axes won't be an array)
-                if num_plots == 1:
-                    axes = [axes]
-                
-                # Plot 1: Original Image
                 axes[0].imshow(mri_slice, cmap='gray')
-                axes[0].set_title(f"{plot_titles[0]} ({slice_idx})", fontsize=12, pad=10)
+                axes[0].set_title(f"Original ({slice_idx})")
                 axes[0].axis('off')
                 
-                current_col = 1
-                
-                # Plot 2: Ground Truth (Optional)
+                curr = 1
                 if gt_vol is not None:
-                    gt_slice_masked = np.ma.masked_where(gt_vol[:, :, slice_idx] == 0, gt_vol[:, :, slice_idx])
-                    axes[current_col].imshow(mri_slice, cmap='gray')
-                    axes[current_col].imshow(gt_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
-                    axes[current_col].set_title(plot_titles[current_col], fontsize=12, pad=10)
-                    axes[current_col].axis('off')
-                    current_col += 1
+                    gt_m = np.ma.masked_where(gt_vol[:, :, slice_idx] == 0, gt_vol[:, :, slice_idx])
+                    axes[curr].imshow(mri_slice, cmap='gray')
+                    axes[curr].imshow(gt_m, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
+                    axes[curr].set_title("Ground Truth")
+                    axes[curr].axis('off')
+                    curr += 1
                 
-                # Remaining Plots: Selected Model Predictions
-                for model_name in active_models:
-                    pred_vol = st.session_state['all_preds'][model_name]
-                    pred_slice = pred_vol[:, :, slice_idx]
-                    pred_slice_masked = np.ma.masked_where(pred_slice == 0, pred_slice)
-                    
-                    axes[current_col].imshow(mri_slice, cmap='gray')
-                    axes[current_col].imshow(pred_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
-                    axes[current_col].set_title(plot_titles[current_col], fontsize=12, pad=10)
-                    axes[current_col].axis('off')
-                    current_col += 1
+                for m_name in active_models:
+                    p_slice = st.session_state['all_preds'][m_name][:, :, slice_idx]
+                    p_m = np.ma.masked_where(p_slice == 0, p_slice)
+                    axes[curr].imshow(mri_slice, cmap='gray')
+                    axes[curr].imshow(p_m, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
+                    axes[curr].set_title(m_name)
+                    axes[curr].axis('off')
+                    curr += 1
                 
-                plt.tight_layout()
                 st.pyplot(fig)
-                
-                st.markdown("Legend: Red: NCR/NET | Green: Edema | Blue: Enhancing Tumor")
-                
-                # Display Metrics Scoreboard for active models
-                st.markdown("### Model Comparison Scoreboard")
-                m_cols = st.columns(len(active_models))
-                for idx, m_name in enumerate(active_models):
-                    with m_cols[idx]:
-                        st.markdown(f"**{m_name}**")
-                        metrics = MODEL_METRICS.get(m_name, {})
-                        st.write(f"DSC: {metrics.get('DSC', 'N/A')}")
-                        st.write(f"HD: {metrics.get('HD', 'N/A')} mm")
-            else:
-                st.info("Upload your scan and select up to 3 models to begin comparison.")
+                st.markdown("Red: NCR/NET | Green: Edema | Blue: Enhancing Tumor")
 
     elif page == "2. Model Information":
         st.title("Model Selection Scoreboard")
