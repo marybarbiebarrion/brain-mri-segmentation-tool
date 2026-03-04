@@ -227,7 +227,7 @@ def main():
                         st.session_state['pred_mask'] = run_model_inference_3d(st.session_state['mri_data'], selected_model)
                         if uploaded_gt is not None:
                             gt_data = load_nifti_file(uploaded_gt).astype(np.int64)
-                            gt_data[gt_data == 4] = 3 # Map label 4 to 3
+                            gt_data[gt_data == 4] = 3 
                             st.session_state['gt_data'] = gt_data
                         else:
                             st.session_state['gt_data'] = None
@@ -243,48 +243,78 @@ def main():
                 max_slice = mri_vol.shape[2] - 1
                 slice_idx = st.slider("Navigate Brain Slices (Z-axis)", 0, max_slice, max_slice // 2)
                 
-                # Define BraTS colormap: 0=Transparent, 1=Red(NCR), 2=Green(Edema), 3=Blue(ET)
-                # We use 'none' for the first color so 0 values don't paint the screen black/green
                 brats_cmap = ListedColormap(['none', 'red', 'limegreen', 'blue'])
                 
                 mri_slice, pred_slice = mri_vol[:, :, slice_idx], pred_vol[:, :, slice_idx]
-                
-                # Critically mask the background class (0) so matplotlib makes it transparent
                 pred_slice_masked = np.ma.masked_where(pred_slice == 0, pred_slice)
                 
+                # Dynamic column ordering based on Ground Truth availability
                 num_plots = 2 if gt_vol is None else 3
                 fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
                 
-                # 1. Input MRI
+                # Column 1: Always Original Image
                 axes[0].imshow(mri_slice, cmap='gray')
-                axes[0].set_title(f"Input MRI (Slice {slice_idx})", fontsize=14, pad=10)
+                axes[0].set_title(f"Original Image (Slice {slice_idx})", fontsize=14, pad=10)
                 axes[0].axis('off')
                 
-                # 2. Predicted Overlay
-                axes[1].imshow(mri_slice, cmap='gray')
-                # Overlay the prediction on top of the MRI using vmin=0, vmax=3 to lock the colors
-                axes[1].imshow(pred_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
-                axes[1].set_title("Predicted Overlay", fontsize=14, pad=10)
-                axes[1].axis('off')
-                
-                # 3. Ground Truth Overlay (If provided)
                 if gt_vol is not None:
+                    # Order: Original, Ground Truth, Predicted
                     gt_slice_masked = np.ma.masked_where(gt_vol[:, :, slice_idx] == 0, gt_vol[:, :, slice_idx])
+                    
+                    # Column 2: Ground Truth
+                    axes[1].imshow(mri_slice, cmap='gray')
+                    axes[1].imshow(gt_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
+                    axes[1].set_title("Ground Truth Overlay", fontsize=14, pad=10)
+                    axes[1].axis('off')
+                    
+                    # Column 3: Predicted
                     axes[2].imshow(mri_slice, cmap='gray')
-                    axes[2].imshow(gt_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
-                    axes[2].set_title("Ground Truth Overlay", fontsize=14, pad=10)
+                    axes[2].imshow(pred_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
+                    axes[2].set_title("Predicted Overlay", fontsize=14, pad=10)
                     axes[2].axis('off')
+                else:
+                    # Order: Original, Predicted
+                    axes[1].imshow(mri_slice, cmap='gray')
+                    axes[1].imshow(pred_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
+                    axes[1].set_title("Predicted Overlay", fontsize=14, pad=10)
+                    axes[1].axis('off')
                 
                 plt.tight_layout()
                 st.pyplot(fig)
                 
-                st.markdown("**Legend:** 🔴 NCR/NET &nbsp;&nbsp;|&nbsp;&nbsp; 🟢 Edema &nbsp;&nbsp;|&nbsp;&nbsp; 🔵 Enhancing Tumor")
+                st.markdown("**Legend:** Red: NCR/NET | Green: Edema | Blue: Enhancing Tumor")
             else:
                 st.info("Upload your T1/T2 scan, an optional segmentation mask, and click 'Run Analysis'.")
 
     elif page == "2. Model Information":
-        st.title("Model Architectures & Metrics")
-        st.table(MODEL_METRICS)
+        st.title("Model Selection Scoreboard")
+        st.markdown("Use this guide to determine which architecture is best suited for your specific clinical scenario.")
         
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.info("**Best Volumetric Overlap**\n\n### UNet++\n**DSC: 0.1661**\n\nScenario: When capturing the bulk mass and overall volume of the tumor is the highest priority.")
+            
+        with col2:
+            st.success("**Best Boundary Precision**\n\n### SegResNet\n**HD: 8.51 mm**\n\nScenario: For surgical planning where detecting exact tumor edges is critical.")
+            
+        with col3:
+            st.warning("**Best Overall Balance**\n\n### SegResNet\n**S_comp: 0.2600**\n\nScenario: Reliable all-rounder balancing volume detection and boundary precision.")
+
+        st.markdown("---")
+        st.markdown("### Specialized Scenarios")
+        st.markdown("""
+        - **Limited Annotations:** Use **MAE-B** (DSC: 0.1403). It utilizes self-supervised predictive learning.
+        - **Complex Long-Range Context:** Use **Swin UNETR** (DSC: 0.1582). Its transformer-based architecture excels at wide-context 3D scans.
+        """)
+        
+        st.markdown("---")
+        st.markdown("### Complete Performance Rankings (Sorted by Highest DSC)")
+        
+        # Sorting the dictionary by DSC values in descending order
+        sorted_metrics = dict(sorted(MODEL_METRICS.items(), key=lambda item: float(item[1]['DSC']), reverse=True))
+        
+        st.table(sorted_metrics)
+
 if __name__ == "__main__":
     main()
