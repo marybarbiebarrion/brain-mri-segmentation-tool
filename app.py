@@ -151,30 +151,52 @@ def run_model_inference_3d(image_volume, model_name):
     if model is None:
         return pred_volume
 
+    # Define models that strictly require 256x256 inputs
+    requires_padding = model_name in ["UNet++", "Swin UNETR", "SegResNet"]
+
     with torch.no_grad():
         for slice_idx in range(image_volume.shape[2]):
             slice_2d = image_volume[:, :, slice_idx].astype(np.float32)
-            if np.max(slice_2d) == 0: continue # Skip empty slices
+            if np.max(slice_2d) == 0: continue # Skip empty background slices
                 
+            # Normalize the slice
             slice_norm = (slice_2d - slice_2d.min()) / (slice_2d.max() - slice_2d.min() + 1e-8)
+            original_h, original_w = slice_norm.shape[0], slice_norm.shape[1]
             
-            # Padding to 240x240 for ViT architectures
-            pad_h = max(0, 240 - slice_norm.shape[0])
-            pad_w = max(0, 240 - slice_norm.shape[1])
-            if pad_h > 0 or pad_w > 0:
-                 slice_norm = np.pad(slice_norm, ((0, pad_h), (0, pad_w)), mode='constant')
+            # --- CONDITIONAL PADDING FOR BASELINE MODELS ---
+            if requires_padding:
+                # Pad from 240x240 to 256x256 (adding 8 pixels on all sides)
+                pad_h = max(0, 256 - original_h)
+                pad_w = max(0, 256 - original_w)
+                # Pad equally on both sides: (left, right, top, bottom)
+                pad_left, pad_right = pad_w // 2, pad_w - (pad_w // 2)
+                pad_top, pad_bottom = pad_h // 2, pad_h - (pad_h // 2)
+                
+                slice_norm = np.pad(slice_norm, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='constant')
+            else:
+                # Standard padding to 240x240 for custom ViT models if needed
+                pad_h = max(0, 240 - original_h)
+                pad_w = max(0, 240 - original_w)
+                if pad_h > 0 or pad_w > 0:
+                     slice_norm = np.pad(slice_norm, ((0, pad_h), (0, pad_w)), mode='constant')
                  
             input_tensor = torch.tensor(slice_norm).float().unsqueeze(0).unsqueeze(0).to(device)
             
-            # Monai models return a tuple/list in eval mode sometimes, handle cleanly
+            # Inference
             seg_logits = model(input_tensor)
             if isinstance(seg_logits, (tuple, list)): seg_logits = seg_logits[0]
                 
+            # Get the predicted class (0 to 3)
             seg_pred = torch.argmax(seg_logits, dim=1).cpu().squeeze().numpy()
             
-            # Crop padding back to original image dimensions
-            h, w = image_volume.shape[0], image_volume.shape[1]
-            pred_volume[:, :, slice_idx] = seg_pred[:h, :w]
+            # --- CROPPING BACK TO ORIGINAL SIZE ---
+            if requires_padding:
+                # Remove the 8-pixel border we added
+                seg_pred = seg_pred[pad_top : pad_top + original_h, pad_left : pad_left + original_w]
+            else:
+                seg_pred = seg_pred[:original_h, :original_w]
+                
+            pred_volume[:, :, slice_idx] = seg_pred
             
     return pred_volume
 
@@ -221,39 +243,48 @@ def main():
                 max_slice = mri_vol.shape[2] - 1
                 slice_idx = st.slider("Navigate Brain Slices (Z-axis)", 0, max_slice, max_slice // 2)
                 
+                # Define BraTS colormap: 0=Transparent, 1=Red(NCR), 2=Green(Edema), 3=Blue(ET)
+                # We use 'none' for the first color so 0 values don't paint the screen black/green
+                brats_cmap = ListedColormap(['none', 'red', 'limegreen', 'blue'])
+                
                 mri_slice, pred_slice = mri_vol[:, :, slice_idx], pred_vol[:, :, slice_idx]
+                
+                # Critically mask the background class (0) so matplotlib makes it transparent
                 pred_slice_masked = np.ma.masked_where(pred_slice == 0, pred_slice)
                 
-                num_plots = 3 if gt_vol is None else 4
+                num_plots = 2 if gt_vol is None else 3
                 fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 6))
                 
+                # 1. Input MRI
                 axes[0].imshow(mri_slice, cmap='gray')
-                axes[0].set_title(f"Input MRI (Slice {slice_idx})", fontsize=14, pad=10); axes[0].axis('off')
+                axes[0].set_title(f"Input MRI (Slice {slice_idx})", fontsize=14, pad=10)
+                axes[0].axis('off')
                 
+                # 2. Predicted Overlay
                 axes[1].imshow(mri_slice, cmap='gray')
+                # Overlay the prediction on top of the MRI using vmin=0, vmax=3 to lock the colors
                 axes[1].imshow(pred_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
-                axes[1].set_title("Predicted Overlay", fontsize=14, pad=10); axes[1].axis('off')
+                axes[1].set_title("Predicted Overlay", fontsize=14, pad=10)
+                axes[1].axis('off')
                 
+                # 3. Ground Truth Overlay (If provided)
                 if gt_vol is not None:
                     gt_slice_masked = np.ma.masked_where(gt_vol[:, :, slice_idx] == 0, gt_vol[:, :, slice_idx])
                     axes[2].imshow(mri_slice, cmap='gray')
                     axes[2].imshow(gt_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
-                    axes[2].set_title("Ground Truth Overlay", fontsize=14, pad=10); axes[2].axis('off')
-                    
-                    axes[3].imshow(pred_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.8)
-                    axes[3].set_title("Prediction Isolated", fontsize=14, pad=10); axes[3].axis('off')
-                else:
-                    axes[2].imshow(pred_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.8)
-                    axes[2].set_title("Prediction Isolated", fontsize=14, pad=10); axes[2].axis('off')
+                    axes[2].set_title("Ground Truth Overlay", fontsize=14, pad=10)
+                    axes[2].axis('off')
                 
-                plt.tight_layout(); st.pyplot(fig)
+                plt.tight_layout()
+                st.pyplot(fig)
+                
                 st.markdown("**Legend:** 🔴 NCR/NET &nbsp;&nbsp;|&nbsp;&nbsp; 🟢 Edema &nbsp;&nbsp;|&nbsp;&nbsp; 🔵 Enhancing Tumor")
             else:
-                st.info("👈 Upload your T1/T2 scan, an optional segmentation mask, and click 'Run Analysis'.")
+                st.info("Upload your T1/T2 scan, an optional segmentation mask, and click 'Run Analysis'.")
 
     elif page == "2. Model Information":
         st.title("Model Architectures & Metrics")
         st.table(MODEL_METRICS)
-
+        
 if __name__ == "__main__":
     main()
