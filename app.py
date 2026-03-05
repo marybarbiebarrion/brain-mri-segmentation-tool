@@ -350,17 +350,32 @@ def main():
 
     elif page == "2. Model Information":
         st.title("Model Selection Scoreboard")
-        # [Existing Scoreboard code goes here]
+        st.markdown("Use this guide to determine which architecture is best suited for your specific clinical scenario.")
+        
         col1, col2, col3 = st.columns(3)
+        
         with col1:
-            st.info("Best Volumetric Overlap\n\n### UNet++\n**DSC: 0.1661**\n\nScenario: Volume priority.")
+            st.info("**Best Volumetric Overlap**\n\n### UNet++\n**DSC: 0.1661**\n\nScenario: When capturing the bulk mass and overall volume of the tumor is the highest priority.")
+            
         with col2:
-            st.success("Best Boundary Precision\n\n### SegResNet\n**HD: 8.51 mm**\n\nScenario: Surgical precision.")
+            st.success("**Best Boundary Precision**\n\n### SegResNet\n**HD: 8.51 mm**\n\nScenario: For surgical planning where detecting exact tumor edges is critical.")
+            
         with col3:
-            st.warning("Best Overall Balance\n\n### SegResNet\n**S_comp: 0.2600**\n\nScenario: Reliable all-rounder.")
+            st.warning("**Best Overall Balance**\n\n### SegResNet\n**S_comp: 0.2600**\n\nScenario: Reliable all-rounder balancing volume detection and boundary precision.")
+
+        st.markdown("---")
+        st.markdown("### Specialized Scenarios")
+        st.markdown("""
+        - **Limited Annotations:** Use **MAE-B** (DSC: 0.1403). It utilizes self-supervised predictive learning.
+        - **Complex Long-Range Context:** Use **Swin UNETR** (DSC: 0.1582). Its transformer-based architecture excels at wide-context 3D scans.
+        """)
         
         st.markdown("---")
+        st.markdown("### Complete Performance Rankings (Sorted by Highest DSC)")
+        
+        # Sorting the dictionary by DSC values in descending order
         sorted_metrics = dict(sorted(MODEL_METRICS.items(), key=lambda item: float(item[1]['DSC']), reverse=True))
+        
         st.table(sorted_metrics)
 
 if __name__ == "__main__":
