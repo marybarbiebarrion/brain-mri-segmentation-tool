@@ -16,29 +16,57 @@ import segmentation_models_pytorch as smp
 from monai.networks.nets import SwinUNETR, SegResNet
 
 # ==============================================================================
-# 1. CUSTOM ARCHITECTURE CLASSES (For MAE-B, DINO, CMAE, BYOL, MAE, UNET)
+# 1. CUSTOM ARCHITECTURE CLASSES (100% SEPARATED FOR FAIRNESS)
 # ==============================================================================
 
-class ViTEncoderForSegmentation(nn.Module):
+# --- ENCODERS ---
+class MAE_B_Encoder(nn.Module):
     def __init__(self, in_channels=1, image_size=240, patch_size=16, emb_dim=192, num_layer=12, num_head=3):
         super().__init__()
-        self.patch_size = patch_size
-        self.pos_embedding = nn.Parameter(torch.zeros(1, (image_size // patch_size) ** 2, emb_dim))
         self.patchify = nn.Conv2d(in_channels, emb_dim, patch_size, patch_size)
+        self.pos_embedding = nn.Parameter(torch.zeros(1, (image_size // patch_size) ** 2, emb_dim))
         self.transformer_blocks = nn.ModuleList([Block(emb_dim, num_head) for _ in range(num_layer)])
         self.init_weight()
     def init_weight(self): trunc_normal_(self.pos_embedding, std=.02)
     def forward(self, img):
-        patches = self.patchify(img)
-        patches = rearrange(patches, 'b c h w -> b (h w) c') + self.pos_embedding
+        x = self.patchify(img); x = rearrange(x, 'b c h w -> b (h w) c') + self.pos_embedding
         features = []
-        x = patches
         for i, block in enumerate(self.transformer_blocks):
             x = block(x)
-            if i in [2, 5, 8, 11]: 
-                features.append(rearrange(x, 'b (h w) c -> b c h w', h=img.shape[2]//self.patch_size))
+            if i in [2, 5, 8, 11]: features.append(rearrange(x, 'b (h w) c -> b c h w', h=img.shape[2]//16))
         return features
 
+class Standard_MAE_Encoder(nn.Module):
+    def __init__(self, in_channels=1, image_size=240, patch_size=16, emb_dim=192, num_layer=12, num_head=3):
+        super().__init__()
+        self.patchify = nn.Conv2d(in_channels, emb_dim, patch_size, patch_size)
+        self.pos_embedding = nn.Parameter(torch.zeros(1, (image_size // patch_size) ** 2, emb_dim))
+        self.transformer_blocks = nn.ModuleList([Block(emb_dim, num_head) for _ in range(num_layer)])
+        self.init_weight()
+    def init_weight(self): trunc_normal_(self.pos_embedding, std=.02)
+    def forward(self, img):
+        x = self.patchify(img); x = rearrange(x, 'b c h w -> b (h w) c') + self.pos_embedding
+        features = []
+        for i, block in enumerate(self.transformer_blocks):
+            x = block(x)
+            if i in [2, 5, 8, 11]: features.append(rearrange(x, 'b (h w) c -> b c h w', h=img.shape[2]//16))
+        return features
+
+class DINO_CMAE_Encoder(nn.Module):
+    def __init__(self, in_channels=1, image_size=240, patch_size=16, emb_dim=192, num_layer=12):
+        super().__init__()
+        self.patchify = nn.Conv2d(in_channels, emb_dim, patch_size, patch_size)
+        self.pos_embedding = nn.Parameter(torch.zeros(1, (image_size // patch_size) ** 2, emb_dim))
+        self.blocks = nn.ModuleList([Block(emb_dim, 3) for _ in range(num_layer)])
+    def forward(self, img):
+        x = self.patchify(img); x = rearrange(x, 'b c h w -> b (h w) c') + self.pos_embedding
+        features = []
+        for i, block in enumerate(self.blocks):
+            x = block(x)
+            if i in [5, 7, 9, 11]: features.append(rearrange(x, 'b (h w) c -> b c h w', h=img.shape[2]//16))
+        return features
+
+# --- DECODER ---
 class UNetDecoder(nn.Module):
     def __init__(self, emb_dim=192, num_classes=4):
         super().__init__()
@@ -55,10 +83,7 @@ class UNetDecoder(nn.Module):
             nn.Conv2d(64, num_classes, 1)
         )
     def _make_block(self, i, o):
-        return nn.Sequential(
-            nn.Conv2d(i, o, 3, 1, 1, bias=False), nn.BatchNorm2d(o), nn.ReLU(True), 
-            nn.Conv2d(o, o, 3, 1, 1, bias=False), nn.BatchNorm2d(o), nn.ReLU(True)
-        )
+        return nn.Sequential(nn.Conv2d(i, o, 3, 1, 1, bias=False), nn.BatchNorm2d(o), nn.ReLU(True), nn.Conv2d(o, o, 3, 1, 1, bias=False), nn.BatchNorm2d(o), nn.ReLU(True))
     def forward(self, features):
         f1, f2, f3, f4 = features
         x = self.upconv1(f4); x = torch.cat([x, F.interpolate(f3, size=x.shape[2:])], 1); x = self.dec_block1(x)
@@ -66,17 +91,39 @@ class UNetDecoder(nn.Module):
         x = self.upconv3(x); x = torch.cat([x, F.interpolate(f1, size=x.shape[2:])], 1); x = self.dec_block3(x)
         return self.final_up(x)
 
-class MAE_Segmentation_Model(nn.Module):
+# --- INDIVIDUAL WRAPPERS ---
+class MAEB_Wrapper(nn.Module):
     def __init__(self, encoder, decoder):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-    def forward(self, x): 
-        return self.decoder(self.encoder(x))
+        super().__init__(); self.encoder = encoder; self.decoder = decoder
+    def forward(self, x): return self.decoder(self.encoder(x))
 
+class MAE_Wrapper(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__(); self.encoder = encoder; self.decoder = decoder
+    def forward(self, x): return self.decoder(self.encoder(x))
+
+class DINO_Wrapper(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__(); self.encoder = encoder; self.decoder = decoder
+    def forward(self, x): return self.decoder(self.encoder(x))
+
+class CMAE_Wrapper(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__(); self.encoder = encoder; self.decoder = decoder
+    def forward(self, x): return self.decoder(self.encoder(x))
+
+class BYOL_Wrapper(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__(); self.encoder = encoder; self.decoder = decoder
+    def forward(self, x): return self.decoder(self.encoder(x))
+
+class AttnUNet_Wrapper(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__(); self.encoder = encoder; self.decoder = decoder
+    def forward(self, x): return self.decoder(self.encoder(x))
 
 # ==============================================================================
-# 2. STREAMLIT CONFIGURATION
+# 2. STREAMLIT CONFIGURATION & METRICS
 # ==============================================================================
 
 MODELS = {
@@ -114,108 +161,90 @@ def load_nifti_file(file_buffer):
 
 @st.cache_resource
 def load_pytorch_model(model_name, device):
-    """Dynamically builds the correct architecture based on the dropdown selection."""
-    num_classes = 4 # 0: BG, 1: NCR, 2: Edema, 3: ET
+    """Dynamically builds the correct architecture with strict model separation."""
+    num_classes = 4 
     
+    # 1. BASELINE MODELS
     if model_name == "UNet++":
         model = smp.UnetPlusPlus(encoder_name="resnet34", encoder_weights=None, in_channels=1, classes=num_classes)
-        
     elif model_name == "Swin UNETR":
         model = SwinUNETR(spatial_dims=2, in_channels=1, out_channels=num_classes, feature_size=24, use_checkpoint=True)
-        
     elif model_name == "SegResNet":
         model = SegResNet(spatial_dims=2, in_channels=1, out_channels=num_classes, init_filters=32, blocks_down=[1, 2, 2, 4], blocks_up=[1, 1, 1], dropout_prob=0.2)
         
+    # 2. THESIS MODELS
+    elif model_name == "MAE-B":
+        model = MAEB_Wrapper(MAE_B_Encoder(), UNetDecoder(num_classes=num_classes))
+    elif model_name == "MAE":
+        model = MAE_Wrapper(Standard_MAE_Encoder(), UNetDecoder(num_classes=num_classes))
+    elif model_name == "DINO":
+        model = DINO_Wrapper(DINO_CMAE_Encoder(), UNetDecoder(num_classes=num_classes))
+    elif model_name == "CMAE":
+        model = CMAE_Wrapper(DINO_CMAE_Encoder(), UNetDecoder(num_classes=num_classes))
+    elif model_name == "BYOL":
+        model = BYOL_Wrapper(MAE_B_Encoder(), UNetDecoder(num_classes=num_classes))
+    elif model_name == "Attention U-Net":
+        model = AttnUNet_Wrapper(MAE_B_Encoder(), UNetDecoder(num_classes=num_classes))
     else:
-        # Default thesis architecture for MAE-B, MAE, DINO, CMAE, BYOL, Attention U-Net
-        seg_encoder = ViTEncoderForSegmentation(image_size=240, patch_size=16, emb_dim=192, num_layer=12, num_head=3)
-        seg_decoder = UNetDecoder(emb_dim=192, num_classes=num_classes)
-        model = MAE_Segmentation_Model(seg_encoder, seg_decoder)
+        st.error("Model architecture not found.")
+        return None
 
     model = model.to(device)
     weight_file = MODELS.get(model_name)
     
     try:
-        model.load_state_dict(torch.load(weight_file, map_location=device))
+        model.load_state_dict(torch.load(weight_file, map_location=device), strict=True)
         model.eval()
         return model
     except Exception as e:
-        st.warning(f"Could not load weights for {model_name}. Please ensure {weight_file} is in the same directory.")
+        st.warning(f"Could not load weights for {model_name}. Please ensure {weight_file} matches the exact architecture. Error: {e}")
         return None
 
 def run_model_inference_3d(image_volume, model_name):
-    """Runs the selected model across the Z-axis of the MRI volume."""
+    """Runs high-fidelity inference mapping to spatial capabilities."""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = load_pytorch_model(model_name, device)
     pred_volume = np.zeros_like(image_volume, dtype=np.uint8)
     
-    if model is None:
-        return pred_volume
+    if model is None: return pred_volume
 
-    # Define models that strictly require 256x256 inputs
-    requires_padding = model_name in ["UNet++", "Swin UNETR", "SegResNet"]
+    target_size = 256 if model_name in ["UNet++", "Swin UNETR", "SegResNet"] else 240
 
     with torch.no_grad():
         for slice_idx in range(image_volume.shape[2]):
             slice_2d = image_volume[:, :, slice_idx].astype(np.float32)
-            if np.max(slice_2d) == 0: continue # Skip empty background slices
+            if np.max(slice_2d) == 0: continue 
                 
-            # Normalize the slice
-            slice_norm = (slice_2d - slice_2d.min()) / (slice_2d.max() - slice_2d.min() + 1e-8)
-            original_h, original_w = slice_norm.shape[0], slice_norm.shape[1]
+            s_min, s_max = slice_2d.min(), slice_2d.max()
+            slice_norm = (slice_2d - s_min) / (s_max - s_min + 1e-8)
             
-            # --- CONDITIONAL PADDING FOR BASELINE MODELS ---
-            if requires_padding:
-                # Pad from 240x240 to 256x256 (adding 8 pixels on all sides)
-                pad_h = max(0, 256 - original_h)
-                pad_w = max(0, 256 - original_w)
-                # Pad equally on both sides: (left, right, top, bottom)
-                pad_left, pad_right = pad_w // 2, pad_w - (pad_w // 2)
-                pad_top, pad_bottom = pad_h // 2, pad_h - (pad_h // 2)
-                
-                slice_norm = np.pad(slice_norm, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='constant')
-            else:
-                # Standard padding to 240x240 for custom ViT models if needed
-                pad_h = max(0, 240 - original_h)
-                pad_w = max(0, 240 - original_w)
-                if pad_h > 0 or pad_w > 0:
-                     slice_norm = np.pad(slice_norm, ((0, pad_h), (0, pad_w)), mode='constant')
+            orig_h, orig_w = slice_norm.shape
+            pad_h, pad_w = max(0, target_size - orig_h), max(0, target_size - orig_w)
+            p_top, p_left = pad_h // 2, pad_w // 2
+            slice_norm = np.pad(slice_norm, ((p_top, pad_h-p_top), (p_left, pad_w-p_left)), mode='constant')
                  
-            input_tensor = torch.tensor(slice_norm).float().unsqueeze(0).unsqueeze(0).to(device)
+            input_t = torch.tensor(slice_norm).float().unsqueeze(0).unsqueeze(0).to(device)
             
-            # Inference
-            seg_logits = model(input_tensor)
-            if isinstance(seg_logits, (tuple, list)): seg_logits = seg_logits[0]
-                
-            # Get the predicted class (0 to 3)
-            seg_pred = torch.argmax(seg_logits, dim=1).cpu().squeeze().numpy()
+            output = model(input_t)
+            if isinstance(output, (tuple, list)): output = output[0]
+            seg_pred = torch.argmax(output, dim=1).cpu().squeeze().numpy()
             
-            # --- CROPPING BACK TO ORIGINAL SIZE ---
-            if requires_padding:
-                # Remove the 8-pixel border we added
-                seg_pred = seg_pred[pad_top : pad_top + original_h, pad_left : pad_left + original_w]
-            else:
-                seg_pred = seg_pred[:original_h, :original_w]
-                
-            pred_volume[:, :, slice_idx] = seg_pred
+            pred_volume[:, :, slice_idx] = seg_pred[p_top : p_top + orig_h, p_left : p_left + orig_w]
             
     return pred_volume
 
+# ==============================================================================
+# 3. MAIN APP EXECUTION
+# ==============================================================================
+
 def main():
-    # --- INITIALIZE SESSION STATE ---
-    # Prevents KeyErrors by ensuring variables exist before the first 'Run Analysis' click
-    if 'run' not in st.session_state:
-        st.session_state['run'] = False
-    if 'mri_data' not in st.session_state:
-        st.session_state['mri_data'] = None
-    if 'gt_data' not in st.session_state:
-        st.session_state['gt_data'] = None
-    if 'all_preds' not in st.session_state:
-        st.session_state['all_preds'] = {}
-    if 'active_models' not in st.session_state:
-        st.session_state['active_models'] = []
-    if 'execution_time' not in st.session_state:
-        st.session_state['execution_time'] = 0.0
+    # Prevent KeyErrors by ensuring session state variables exist
+    if 'run' not in st.session_state: st.session_state['run'] = False
+    if 'mri_data' not in st.session_state: st.session_state['mri_data'] = None
+    if 'gt_data' not in st.session_state: st.session_state['gt_data'] = None
+    if 'all_preds' not in st.session_state: st.session_state['all_preds'] = {}
+    if 'active_models' not in st.session_state: st.session_state['active_models'] = []
+    if 'execution_time' not in st.session_state: st.session_state['execution_time'] = 0.0
 
     st.set_page_config(page_title="Brain MRI Segmenter", layout="wide", initial_sidebar_state="expanded")
     st.sidebar.title("Navigation Menu")
@@ -232,14 +261,9 @@ def main():
             compare_mode = st.toggle("Enable Model Comparison")
             
             if compare_mode:
-                selected_models = st.multiselect(
-                    "Select up to 3 Models to Compare", 
-                    options=list(MODELS.keys()), 
-                    max_selections=3
-                )
+                selected_models = st.multiselect("Select up to 3 Models to Compare", options=list(MODELS.keys()), max_selections=3)
             else:
-                selected_model = st.selectbox("Select Architecture", list(MODELS.keys()))
-                selected_models = [selected_model]
+                selected_models = [st.selectbox("Select Architecture", list(MODELS.keys()))]
             
             st.markdown("<br>", unsafe_allow_html=True) 
             uploaded_mri = st.file_uploader("Upload MRI Scan (e.g., T1/T2)", type=["nii", "nii.gz"])
@@ -248,17 +272,12 @@ def main():
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Run Analysis", use_container_width=True):
                 if uploaded_mri is not None and len(selected_models) > 0:
-                    # START TIMER
                     start_time = time.time()
-                    
                     with st.spinner(f"Processing 3D volume with {len(selected_models)} model(s)..."):
                         st.session_state['mri_data'] = load_nifti_file(uploaded_mri)
                         st.session_state['all_preds'] = {}
-                        
                         for model_name in selected_models:
-                            st.session_state['all_preds'][model_name] = run_model_inference_3d(
-                                st.session_state['mri_data'], model_name
-                            )
+                            st.session_state['all_preds'][model_name] = run_model_inference_3d(st.session_state['mri_data'], model_name)
                         
                         if uploaded_gt is not None:
                             gt_data = load_nifti_file(uploaded_gt).astype(np.int64)
@@ -267,9 +286,7 @@ def main():
                         else:
                             st.session_state['gt_data'] = None
                             
-                    # END TIMER
-                    end_time = time.time()
-                    st.session_state['execution_time'] = end_time - start_time
+                    st.session_state['execution_time'] = time.time() - start_time
                     st.session_state['run'] = True
                     st.session_state['active_models'] = selected_models
                 elif uploaded_mri is None:
@@ -280,14 +297,12 @@ def main():
         with col2:
             st.subheader("Interactive Comparison Dashboard")
             if st.session_state['run']:
-                # Execution Time Information
                 total_time = st.session_state['execution_time']
                 num_models = len(st.session_state['active_models'])
-                avg_time = total_time / num_models if num_models > 0 else 0
                 
                 t_col1, t_col2 = st.columns(2)
                 t_col1.metric("Total Processing Time", f"{total_time:.2f} s")
-                t_col2.metric("Average Time per Model", f"{avg_time:.2f} s")
+                t_col2.metric("Average Time per Model", f"{total_time / num_models if num_models > 0 else 0:.2f} s")
 
                 mri_vol = st.session_state['mri_data']
                 gt_vol = st.session_state['gt_data']
@@ -296,15 +311,11 @@ def main():
                 max_slice = mri_vol.shape[2] - 1
                 slice_idx = st.slider("Navigate Brain Slices (Z-axis)", 0, max_slice, max_slice // 2)
                 
-                brats_cmap = ListedColormap(['none', 'red', 'limegreen', 'blue'])
                 mri_slice = mri_vol[:, :, slice_idx]
                 
-                # Dynamic column logic: [Original] + [GT] + [Predictions...]
                 plot_titles = ["Original Image"]
-                if gt_vol is not None:
-                    plot_titles.append("Ground Truth")
-                for m_name in active_models:
-                    plot_titles.append(f"Pred: {m_name}")
+                if gt_vol is not None: plot_titles.append("Ground Truth")
+                for m_name in active_models: plot_titles.append(f"Pred: {m_name}")
                 
                 num_plots = len(plot_titles)
                 fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 5))
@@ -316,18 +327,18 @@ def main():
                 
                 current_col = 1
                 if gt_vol is not None:
-                    gt_slice_masked = np.ma.masked_where(gt_vol[:, :, slice_idx] == 0, gt_vol[:, :, slice_idx])
+                    gt_mask = np.ma.masked_where(gt_vol[:, :, slice_idx] == 0, gt_vol[:, :, slice_idx])
                     axes[current_col].imshow(mri_slice, cmap='gray')
-                    axes[current_col].imshow(gt_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
+                    axes[current_col].imshow(gt_mask, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
                     axes[current_col].set_title("Ground Truth", fontsize=12, pad=10)
                     axes[current_col].axis('off')
                     current_col += 1
                 
                 for model_name in active_models:
-                    pred_vol = st.session_state['all_preds'][model_name]
-                    pred_slice_masked = np.ma.masked_where(pred_vol[:, :, slice_idx] == 0, pred_vol[:, :, slice_idx])
+                    pred_slice = st.session_state['all_preds'][model_name][:, :, slice_idx]
+                    pred_mask = np.ma.masked_where(pred_slice == 0, pred_slice)
                     axes[current_col].imshow(mri_slice, cmap='gray')
-                    axes[current_col].imshow(pred_slice_masked, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
+                    axes[current_col].imshow(pred_mask, cmap=brats_cmap, vmin=0, vmax=3, alpha=0.6)
                     axes[current_col].set_title(f"Pred: {model_name}", fontsize=12, pad=10)
                     axes[current_col].axis('off')
                     current_col += 1
@@ -336,7 +347,6 @@ def main():
                 st.pyplot(fig)
                 st.markdown("Legend: Red: NCR/NET | Green: Edema | Blue: Enhancing Tumor")
                 
-                # Metrics Scoreboard
                 st.markdown("### Model Performance Comparison")
                 m_cols = st.columns(len(active_models))
                 for idx, m_name in enumerate(active_models):
@@ -350,33 +360,16 @@ def main():
 
     elif page == "2. Model Information":
         st.title("Model Selection Scoreboard")
-        st.markdown("Use this guide to determine which architecture is best suited for your specific clinical scenario.")
-        
         col1, col2, col3 = st.columns(3)
-        
         with col1:
-            st.info("**Best Volumetric Overlap**\n\n### UNet++\n**DSC: 0.1661**\n\nScenario: When capturing the bulk mass and overall volume of the tumor is the highest priority.")
-            
+            st.info("Best Volumetric Overlap\n\n### UNet++\n**DSC: 0.1661**\n\nScenario: Volume priority.")
         with col2:
-            st.success("**Best Boundary Precision**\n\n### SegResNet\n**HD: 8.51 mm**\n\nScenario: For surgical planning where detecting exact tumor edges is critical.")
-            
+            st.success("Best Boundary Precision\n\n### SegResNet\n**HD: 8.51 mm**\n\nScenario: Surgical precision.")
         with col3:
-            st.warning("**Best Overall Balance**\n\n### SegResNet\n**S_comp: 0.2600**\n\nScenario: Reliable all-rounder balancing volume detection and boundary precision.")
-
-        st.markdown("---")
-        st.markdown("### Specialized Scenarios")
-        st.markdown("""
-        - **Limited Annotations:** Use **MAE-B** (DSC: 0.1403). It utilizes self-supervised predictive learning.
-        - **Complex Long-Range Context:** Use **Swin UNETR** (DSC: 0.1582). Its transformer-based architecture excels at wide-context 3D scans.
-        """)
+            st.warning("Best Overall Balance\n\n### SegResNet\n**S_comp: 0.2600**\n\nScenario: Reliable all-rounder.")
         
         st.markdown("---")
-        st.markdown("### Complete Performance Rankings (Sorted by Highest DSC)")
-        
-        # Sorting the dictionary by DSC values in descending order
-        sorted_metrics = dict(sorted(MODEL_METRICS.items(), key=lambda item: float(item[1]['DSC']), reverse=True))
-        
-        st.table(sorted_metrics)
+        st.table(dict(sorted(MODEL_METRICS.items(), key=lambda item: float(item[1]['DSC']), reverse=True)))
 
 if __name__ == "__main__":
     main()
